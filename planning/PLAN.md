@@ -454,3 +454,71 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
+---
+
+## 13. Document Review — Questions, Clarifications & Simplification Opportunities
+
+*Review conducted 2026-03-09. Based on current project state: market data backend complete (8 modules, 73 tests passing); all other components not yet started.*
+
+### Questions & Clarifications Needed
+
+**Architecture & Data Flow**
+
+1. **SSE stream scope vs. watchlist**: Section 6 says the SSE stream pushes prices "for all tickers known to the system" and notes this is "equivalent to the user's watchlist" in the single-user model. But what happens when a user adds a ticker via the watchlist API — does the simulator/Massive poller dynamically pick up the new ticker, or does it only stream the original 10? The simulator already starts with fixed seed prices in `seed_prices.py`. The plan should clarify whether the market data source's ticker set is static (the 10 defaults) or dynamically follows the watchlist.
+
+2. **Portfolio snapshot timing**: Section 7 says snapshots are recorded "every 30 seconds by a background task, and immediately after each trade." But the P&L chart on the frontend will look sparse with only 2 data points per minute. Is 30 seconds intentional, or should this be more frequent (e.g., every 5-10 seconds) to make the chart feel alive? Alternatively, could the frontend interpolate between snapshots using live SSE prices?
+
+3. **Chat history depth**: Section 9 says "recent conversation history" is loaded. How many messages? The plan doesn't specify a limit. Unbounded history will eventually exceed LLM context windows and inflate costs. Suggest specifying a cap (e.g., last 20 messages or last N tokens).
+
+4. **Fractional shares**: The schema says `quantity REAL` with "fractional shares supported," but section 2 describes buying/selling "shares" with no mention of fractional UI. Should the trade bar allow decimal quantities (e.g., buy 0.5 shares of AMZN)? Or is this just future-proofing the schema?
+
+5. **"Daily change %"** in watchlist: Section 10 says the watchlist shows "daily change %." But with a simulator, there's no concept of a daily open/close — prices start fresh each time the container launches. What is the baseline for calculating change %? First price since page load? First price since container start? This needs a clear definition.
+
+**API Design**
+
+6. **DELETE /api/watchlist/{ticker}**: Uses the ticker symbol in the URL path. What if a ticker contains special characters (e.g., BRK.B)? Consider using query parameters or URL encoding conventions. Also, should removing a ticker that the user holds a position in be allowed? The plan is silent on this edge case.
+
+7. **POST /api/portfolio/trade response shape**: The plan specifies the request body (`{ticker, quantity, side}`) but not the response. Should it return the updated portfolio state, just the trade confirmation, or both? The frontend needs to know what to refresh after a trade.
+
+8. **GET /api/portfolio response**: Section 8 says it returns "current positions, cash balance, total value, unrealized P&L" but doesn't define the JSON shape. Consider specifying this to align frontend and backend agents.
+
+9. **Error response format**: No standardized error response shape is defined. Should errors return `{error: string, detail?: string}` with appropriate HTTP status codes? This matters for both the frontend and the LLM's trade-failure feedback.
+
+**LLM Integration**
+
+10. **Model availability**: The plan specifies `openrouter/openai/gpt-oss-120b` with Cerebras inference. Model availability on OpenRouter can change. Should there be a fallback model specified? What happens if the model is unavailable?
+
+11. **Structured output reliability**: The plan assumes the LLM always returns valid JSON matching the schema. In practice, even with structured output mode, edge cases occur. The plan mentions "graceful handling of malformed responses" in the testing section but doesn't describe the actual fallback behavior. Suggest: if JSON parsing fails, return the raw text as the message with no actions.
+
+12. **Trade validation in chat flow**: If the LLM requests 3 trades and the 2nd one fails (e.g., insufficient cash after the 1st trade spent most of it), should trades 1 and 3 still execute? Or should it be all-or-nothing? The plan doesn't specify atomicity semantics.
+
+### Simplification Opportunities
+
+**High-value simplifications (recommended)**
+
+- **Drop `user_id` from all tables**: The plan acknowledges this is single-user and says user_id is for "future multi-user support." But adding multi-user later would require auth, sessions, and security — a much bigger change than a schema migration. The `user_id` column adds cognitive overhead to every query for zero current benefit. Suggest removing it and keeping the schema minimal. If multi-user is ever needed, a migration is trivial compared to the auth work required.
+
+- **Drop `portfolio_snapshots` background task**: Instead of a background task writing snapshots every 30 seconds, consider computing portfolio value on-demand from positions + live prices. The P&L chart could use trade timestamps as data points (portfolio value at time of each trade), plus the current live value. This eliminates a background task, a database table, and the timing question from item #2 above.
+
+- **Simplify chat_messages.actions column**: Storing executed actions as a JSON string in a TEXT column works but makes querying difficult. Since this data is only read back for display (showing "Bought 10 AAPL" inline in chat), consider just including action summaries in the `content` field itself, eliminating the separate `actions` column.
+
+- **Drop Windows PowerShell scripts**: The plan calls for both bash and PowerShell start/stop scripts. Docker Desktop on Windows supports bash via WSL2 or Git Bash. Maintaining two sets of scripts doubles the work for a narrow audience. Suggest providing bash scripts only with a note that Windows users should use WSL2 or Git Bash.
+
+**Lower-priority simplifications (consider)**
+
+- **Static export vs. SPA routing**: The plan specifies Next.js with `output: 'export'` for a single-page app. For a true SPA with no server-side routing needs, a lighter build tool (Vite + React) would eliminate Next.js complexity (file-based routing, app directory conventions) that goes unused. However, if Next.js is a deliberate teaching choice for the course, keep it.
+
+- **Treemap/heatmap complexity**: The portfolio heatmap (treemap) is visually impressive but complex to implement well — sizing, labeling, color scaling, and responsiveness are all non-trivial. With only 10 possible tickers and likely fewer positions, a simple colored bar chart or card grid would convey the same information with much less implementation effort. Consider whether the treemap is worth the complexity for the capstone scope.
+
+### Missing from the Plan
+
+- **CORS / static file serving configuration**: The plan says "no CORS needed" because the frontend is served from the same origin. But during local development (frontend on port 3000, backend on port 8000), CORS will be needed. The plan should mention a development-mode CORS configuration or a proxy setup.
+
+- **Development workflow**: There's no section on how to run the backend and frontend locally for development (outside Docker). Developers will need: `uv run uvicorn` for the backend, `npm run dev` for the frontend, and some way to proxy API calls. This is important for the agents building the system.
+
+- **Database reset / fresh start**: How does a user reset their portfolio to $10k and clear all trades? The plan should specify whether there's an API endpoint or if it requires deleting the SQLite file and restarting.
+
+- **Rate limiting on trade execution**: Nothing prevents a user (or the LLM) from executing hundreds of trades per second. While this is a demo, a runaway LLM loop could fill the trades table quickly. Consider a simple rate limit or sanity check.
+
+- **SSE reconnection behavior**: The plan says "EventSource has built-in retry" but doesn't specify what happens to the sparkline data or price cache on reconnection. Does the frontend restart sparklines from scratch, or does it preserve accumulated data? This affects the user experience during brief network interruptions.
