@@ -522,3 +522,180 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - **Rate limiting on trade execution**: Nothing prevents a user (or the LLM) from executing hundreds of trades per second. While this is a demo, a runaway LLM loop could fill the trades table quickly. Consider a simple rate limit or sanity check.
 
 - **SSE reconnection behavior**: The plan says "EventSource has built-in retry" but doesn't specify what happens to the sparkline data or price cache on reconnection. Does the frontend restart sparklines from scratch, or does it preserve accumulated data? This affects the user experience during brief network interruptions.
+
+---
+
+## 14. Independent Document Review — Questions, Gaps & Simplifications
+
+*Review conducted 2026-03-09 by Claude Opus 4.6 (codex-reviewer). Based on reading the full PLAN.md and inspecting the implemented codebase: 8 market data modules under `backend/app/market/`, 73 tests passing, `pyproject.toml`, `backend/CLAUDE.md`. No frontend, database, Docker, or LLM integration code exists yet.*
+
+### Executive Summary
+
+PLAN.md is a high-quality specification — well-structured, opinionated, and detailed enough for most components. However, five categories of issues need attention before the next implementation phase: (1) the plan does not specify the FastAPI application entrypoint or how components are wired together, which is the most immediate blocker; (2) the SSE event format described in the plan contradicts the implemented code; (3) no API response schemas are defined, which will cause frontend/backend misalignment; (4) the LLM dependency (`litellm`) is missing from `pyproject.toml`; and (5) there is no development workflow section, so agents won't know how to run the app locally.
+
+Section 13's self-review is strong and catches many real issues. This review confirms those findings and adds several not previously identified.
+
+### Questions Requiring Resolution
+
+**Q1. Where does the FastAPI `app` object live and how is the lifecycle wired?**
+The plan describes routes, SSE, database init, and background tasks, but never specifies the application entrypoint. There is no `backend/app/main.py` (or equivalent). The next agent needs to know:
+- Where the `FastAPI()` instance is created
+- How `lifespan` or `on_event("startup")`/`on_event("shutdown")` starts and stops the `MarketDataSource`
+- How the `PriceCache` singleton is shared across the SSE router, trade execution, and portfolio valuation
+- How `StaticFiles` mounts the frontend build (must come after `/api/*` routes)
+
+This is the single most critical gap — without it, the backend agent must invent the application architecture and may make choices that conflict with the existing market data code.
+
+**Q2. What is the actual SSE event format?**
+Section 6 says "Each SSE event contains ticker, price, previous price, timestamp, and change direction" — implying one event per ticker. The implemented `stream.py` (line 81-83) sends a single `data:` event containing ALL tickers as a JSON object keyed by symbol:
+```
+data: {"AAPL": {"ticker": "AAPL", "price": 190.50, ...}, "GOOGL": {...}, ...}
+```
+This is actually the better design (fewer events, atomic snapshot), but the plan must be updated to match the implementation or the frontend agent will build the wrong parser.
+
+**Q3. What JSON shapes do the API endpoints return?**
+Section 8 defines five REST endpoints but specifies zero response schemas. At minimum, the plan needs shapes for:
+- `GET /api/portfolio` — How are positions structured? Does `unrealized_pnl` come from `PriceCache` prices? Is `total_value` included at the top level?
+- `POST /api/portfolio/trade` — Does it return the executed trade, the updated portfolio, or both?
+- `GET /api/watchlist` — Just ticker strings, or ticker objects with current prices from the cache?
+- `POST /api/chat` — Is the response the raw LLM structured output or a wrapper with metadata?
+- All errors — What HTTP status codes and body shape? FastAPI defaults to `{"detail": "..."}` for `HTTPException`, but this should be stated explicitly.
+
+**Q4. Where does the main chart get its data?**
+Section 10 says clicking a ticker shows "a larger detailed chart... with at minimum price over time." But the only data source is the SSE stream, which provides only the latest price. Is the main chart built from client-side accumulated SSE data (starts empty, fills in over time)? Or should there be a REST endpoint for historical prices? The plan must specify this — it changes both frontend and potentially backend work.
+
+**Q5. How does the frontend keep portfolio value live?**
+The header shows "portfolio total value (updating live)" and the positions table shows "current price." The only real-time channel is the price SSE stream. Three options exist:
+- (a) Poll `GET /api/portfolio` periodically
+- (b) Compute portfolio value client-side from SSE prices + locally-cached positions
+- (c) Add a second SSE stream for portfolio data
+Option (b) is most efficient but requires the frontend to maintain position state and recompute on every tick. The plan should specify the approach.
+
+**Q6. Can a user buy a ticker not on the watchlist?**
+The trade bar has a free-form ticker field. If the user types a ticker not on the watchlist, there is no price in the `PriceCache`, so the trade has no execution price. The plan should specify: either auto-add to the watchlist on trade, or require the ticker to be on the watchlist first (with a clear error message).
+
+**Q7. What happens to positions when a ticker is removed from the watchlist?**
+Section 13 question #6 raises this but does not resolve it. If a user holds 100 AAPL shares and removes AAPL from the watchlist, the `MarketDataSource.remove_ticker()` stops producing prices and `PriceCache.remove()` deletes the cached price. The portfolio display would then show stale or missing price data. Options:
+- (a) Prevent removal of tickers with open positions (simplest, recommended)
+- (b) Keep streaming the price even if removed from watchlist (complex — decouples watchlist from data source)
+- (c) Allow removal and show last known price (misleading)
+
+**Q8. Is database init on startup or on first request?**
+Section 7 says "The backend checks for the SQLite database on startup (or first request)." These are different strategies. Startup initialization is simpler, avoids first-request latency, and is consistent with how the `MarketDataSource` must also start on boot (to begin producing prices). The plan should pick one — recommend startup via FastAPI `lifespan`.
+
+**Q9. How does the backend know the database file path?**
+The plan says the SQLite file lives at `db/finally.db` relative to the project root, and at `/app/db/finally.db` inside Docker. But the backend code will need a configurable path. Should there be a `DATABASE_PATH` env var, or should the backend hardcode a relative path and rely on the working directory? This must be specified.
+
+**Q10. Is `OPENROUTER_API_KEY` actually required?**
+Section 5 labels it "Required" but the watchlist, portfolio, market data, and trading features should all work without an LLM key — only chat depends on it. The plan should clarify that `OPENROUTER_API_KEY` is required only for the chat feature, and that the app starts and operates normally without it.
+
+### Internal Contradictions
+
+**C1. SSE event format** (Section 6 vs. implemented `stream.py`): As detailed in Q2, the plan describes per-ticker events but the code sends all tickers in a single event. Update the plan to match the code.
+
+**C2. `backend/db/` vs. `db/`**: Section 4 says `backend/db/` contains "schema definitions, seed data, migration logic" and `db/` at the project root is the "runtime volume mount." These are two different directories with confusingly similar purposes. The existing code puts all backend modules under `backend/app/` — database code should follow the same pattern (e.g., `backend/app/db/`). The plan should reconcile these.
+
+**C3. Charting library recommendation**: Section 10 says "Canvas-based charting library preferred (Lightweight Charts or Recharts)." Recharts is SVG-based, not canvas-based. These use fundamentally different rendering approaches with different performance characteristics. Recommend: Lightweight Charts (canvas, by TradingView) for the main price chart and sparklines; Recharts (SVG) for the P&L line chart if a simpler API is preferred there.
+
+**C4. Root directory name**: Section 4 shows the tree rooted at `finally/` but the actual repo is `shisuke-financial-ally`. Cosmetic but could confuse agents referencing the tree.
+
+### Gaps That Would Block or Delay Implementation
+
+**G1. No development workflow section.**
+Agents building the frontend and backend need to know how to run them locally outside Docker. The plan should specify:
+- Backend: `cd backend && uv run uvicorn app.main:app --reload --port 8000`
+- Frontend: `cd frontend && npm run dev` (port 3000)
+- API proxy: Next.js `rewrites` in `next.config.js` to proxy `/api/*` to `localhost:8000`, OR FastAPI CORS middleware in dev mode
+Without this, every agent will spend time figuring out how to run the project, potentially making incompatible choices.
+
+**G2. `litellm` not in dependencies.**
+Sections 3 and 9 say "LiteLLM → OpenRouter" for LLM calls. But `litellm` is not in `pyproject.toml`. Either add it, or specify using `openai` client with a custom `base_url` pointing to OpenRouter (which is the simpler approach and avoids LiteLLM's large dependency tree).
+
+**G3. No `.env.example` file.**
+Section 4 says ".env.example committed" but it doesn't exist. Should be created with placeholder values as part of project scaffolding.
+
+**G4. No error response format.**
+No standardized error response shape is defined. FastAPI defaults to `{"detail": "..."}` for `HTTPException` — the plan should state this explicitly, or define a custom format. Both the frontend and the LLM's trade-failure feedback depend on a predictable error shape.
+
+**G5. SQLite concurrent write safety.**
+The portfolio snapshot background task (every 30s), trade execution (on API request), and chat message storage (on API request) can all write to SQLite concurrently. SQLite's default journal mode serializes writes and can cause `SQLITE_BUSY` errors. The plan should specify WAL mode (`PRAGMA journal_mode=WAL`), which is standard practice for SQLite in web applications.
+
+**G6. `GET /api/portfolio/history` has no query parameters.**
+The P&L chart endpoint needs some way to control the time range. Without parameters, this returns an unbounded dataset that grows indefinitely. Specify at minimum a `limit` parameter (e.g., last N snapshots) or a `since` timestamp filter.
+
+### Technical Risks
+
+**R1. `threading.Lock` in an async application.**
+The `PriceCache` (line 6, `cache.py`) uses `threading.Lock`, which blocks the event loop thread when contended. In practice this is likely fine because the lock is held for microseconds (dict operations), but it is architecturally incorrect for an asyncio application. The `MassiveDataSource` already uses `asyncio.to_thread()` for API calls, meaning the thread pool could contend with the event loop on the cache lock. Consider switching to `asyncio.Lock` or documenting why `threading.Lock` is acceptable here.
+
+**R2. Next.js static export limitations.**
+`output: 'export'` disables server-side features: API routes, middleware, image optimization, dynamic routes with `getServerSideProps`. The plan should note this explicitly so the frontend agent doesn't waste time trying to use unavailable Next.js features. All server logic must go through FastAPI.
+
+**R3. Structured output reliability.**
+The plan assumes the LLM always returns valid JSON. Even with structured output mode, edge cases occur. Define the fallback: if JSON parsing fails, return the raw text as the `message` with no `trades` or `watchlist_changes`.
+
+**R4. No Docker layer caching guidance.**
+The multi-stage Dockerfile installs both Node.js and Python dependencies. Without caching guidance, a clean build will take several minutes every time. The plan should note: copy `package.json`/`package-lock.json` before source code (and `pyproject.toml`/`uv.lock` before backend source) to leverage Docker layer caching.
+
+### Confirming Section 13 Findings
+
+| # | Finding | Verdict |
+|---|---------|---------|
+| 1 | SSE stream scope vs. watchlist | **Resolved by code**: `MarketDataSource` supports dynamic `add_ticker()`/`remove_ticker()`. The ticker set follows the watchlist. Update the plan to state this. |
+| 2 | Portfolio snapshot timing (30s too sparse) | **Agree**. Recommend: snapshot on each trade + frontend interpolation from live SSE prices. Consider dropping the periodic background task entirely. |
+| 3 | Chat history depth unspecified | **Agree**. Cap at 20 messages (10 exchanges). |
+| 4 | Fractional shares in UI | **Agree**. Schema supports them; trade bar UI should accept whole numbers only. LLM may request fractional — allow it. |
+| 5 | "Daily change %" baseline undefined | **Agree**. For simulator: change from first price since container boot. For Massive: actual daily change from market open. State both. |
+| 6 | DELETE watchlist special characters | **Minor risk**. URL encoding handles `BRK.B` fine. The bigger issue (removing tickers with positions) is unresolved — see Q7. |
+| 7-9 | Response shapes undefined | **Critical**. See Q3 above. |
+| 10 | Model availability / fallback | **Agree**. Specify a fallback model. |
+| 11 | Structured output reliability | **Agree**. See R3 above. |
+| 12 | Trade atomicity for LLM multi-trade | **Agree**. Recommend best-effort: execute sequentially, skip failures, include both successes and failures in the response. |
+| Drop `user_id` | **Agree**. Cognitive overhead for zero benefit. Multi-user requires auth, not just a column. |
+| Drop `portfolio_snapshots` task | **Partially agree**. Keep snapshots on trade execution for page-refresh persistence. Drop the periodic 30s task. Frontend supplements with live-computed values. |
+| Drop Windows PowerShell scripts | **Agree**. WSL2 and Git Bash cover Windows users. |
+| Simplify `chat_messages.actions` | **Disagree**. Separate `actions` column lets the frontend render trade confirmations with distinct styling (icons, color, undo). JSON in TEXT is standard SQLite practice. |
+| Vite vs. Next.js | **Worth considering**. For a static SPA with no server-side routing, Vite + React eliminates unused Next.js complexity. But if Next.js is a deliberate course teaching choice, keep it. |
+| Treemap complexity | **Agree**. With ≤10 positions, a colored card grid or bar chart conveys the same information with far less implementation effort. |
+
+### Additional Simplification Opportunities
+
+**S1. Consolidate `backend/db/` into `backend/app/db/`.**
+The existing backend puts all modules under `backend/app/`. Database code should follow the same convention rather than having a separate `backend/db/` directory. This avoids confusion with the runtime `db/` volume mount at the project root.
+
+**S2. Use `openai` client instead of `litellm`.**
+OpenRouter is OpenAI-API-compatible. Using the `openai` Python package with `base_url="https://openrouter.ai/api/v1"` is simpler than adding `litellm` (which has a large dependency tree and its own abstraction layer). This eliminates a dependency and reduces complexity.
+
+**S3. Cap sparkline data arrays.**
+The plan doesn't specify a limit on client-side price history accumulation for sparklines. Unbounded arrays will grow indefinitely in a long-running session. Recommend capping at 200 data points per ticker (a rolling window).
+
+**S4. Drop the separate `users_profile` table.**
+With `user_id` dropped (per Section 13 recommendation), the `users_profile` table holds exactly one row with just `cash_balance` and `created_at`. This could be a simple key-value entry in a `config` table, or even just an in-memory value seeded from a constant and persisted alongside trades. A dedicated table for a single scalar value is over-engineering.
+
+### Prioritized Recommendations
+
+**Must fix before next agent starts:**
+1. Add "Backend Application Structure" section (FastAPI entrypoint, lifecycle, DI, static file serving)
+2. Define API response schemas for all endpoints
+3. Update SSE event format description to match implemented code
+4. Add "Development Workflow" section (local dev, API proxy)
+5. Resolve LLM dependency: add `litellm` or specify `openai` client with OpenRouter base URL
+
+**Should fix before implementation proceeds:**
+6. Specify chat history depth limit (20 messages)
+7. Clarify `OPENROUTER_API_KEY` is optional (chat degrades gracefully)
+8. Define behavior for buying tickers not on the watchlist
+9. Define behavior for removing watched tickers with open positions
+10. Specify SQLite WAL mode
+11. Reconcile `backend/db/` vs `db/` directory confusion
+12. Fix charting library recommendation (Recharts is SVG, not canvas)
+13. Define "change %" baseline (first price since container start)
+
+**Nice to have:**
+14. Create `.env.example` file
+15. Drop `user_id` column from all tables
+16. Add Docker layer caching guidance to Dockerfile section
+17. Specify fallback LLM model
+18. Define `GET /api/portfolio/history` query parameters
+19. Cap sparkline data points (200 per ticker)
+20. Add `POST /api/reset` endpoint for resetting to initial state
